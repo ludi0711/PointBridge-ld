@@ -1,0 +1,20 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "sk-fda74*****06a1",
+    "ANTHROPIC_MODEL": "deepseek-v4-pro[1m]",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-pro[1m]",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-pro[1m]",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-flash",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-flash"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(/root/gx-va/bin/python -c ' *)",
+      "Bash(rm -rf /tmp/synth_eval/*_stats)",
+      "Bash(python tools/stats_pointcloud_occlusion.py --csv_a /tmp/synth_eval/paired_A.csv --label_a \"遮挡训练\\(25%\\)\" --csv_b /tmp/synth_eval/paired_B.csv --label_b \"baseline\\(无遮挡\\)\" --out_dir /tmp/synth_eval/paired_stats)",
+      "Bash(python tools/stats_pointcloud_occlusion.py --csv_a /tmp/synth_eval/unpaired_A.csv --label_a \"A\" --csv_b /tmp/synth_eval/unpaired_B.csv --label_b \"B\" --out_dir /tmp/synth_eval/unpaired_stats)",
+      "Bash(python tools/stats_pointcloud_occlusion.py --csv_a /tmp/synth_eval/paired_A.csv --label_a \"单版\" --out_dir /tmp/synth_eval/single_stats)"
+    ]
+  }
+}

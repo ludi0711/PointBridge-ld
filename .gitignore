@@ -1,0 +1,62 @@
+# Python cache / build artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environments and machine-specific config
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Local third-party checkouts
+third_party/
+thrid_party/
+
+# Isaac Lab / RL runtime outputs
+logs/
+!tools/logs/
+!tools/logs/*.py
+test_log/
+runs/
+outputs/
+wandb/
+
+# Training checkpoints and exported policies
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Logs and shell output
+*.log
+nohup.out
+
+# Backup files
+*.usd.bak
+
+# Local experiment configs
+configs/xarm7_pick_mdp_liftcube_v3.py
+configs/xarm7_pick_env_cfg_liftcube_v88.py
+
+# Omniverse / USD generated thumbnails
+**/.thumbs/
+*.last_generated
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+assets/stl/
+assets/usd/
+
+# Local model weights and encoder checkpoints
+model/*
+!model/.gitkeep
