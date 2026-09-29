@@ -31,6 +31,11 @@ severity 语义（逐模式）：
              抽一个（保证阴影落在相机可见面）；盒朝向（shape_quat_local）随机
              SO(3)，作为椭球主轴方向，**不与工件轴对齐**——工件局部系只用于定位与
              定标，不约束椭球方向。
+
+  severity 张量形式   random_box 额外接受 (B,) 张量 severity（per-env 删除比例，由
+             上层每 episode 采样传入，本层仍是确定性坐标运算）；其余模式仅接受
+             标量，传张量会显式报错。标量路径与张量路径代码物理分离，标量行为
+             与旧版逐位一致。
 """
 
 from __future__ import annotations
@@ -74,7 +79,8 @@ def occlusion_keep(
         obj_pos_b / obj_quat_b: 工件位姿（基座系）。形状 (B, 3) / (B, 4)。
         obj_local_min / obj_local_max: 工件局部包围盒。形状 (3,)。
         mode: 'none' | 'halfspace' | 'sphere' | 'random_sphere' | 'random_box'。
-        severity: 遮挡程度，见模块 docstring 的逐模式语义。
+        severity: 遮挡程度，见模块 docstring 的逐模式语义。float 对所有模式；
+            random_box 额外接受 (B,) 张量（per-env 删除比例，B 与 pts_base 一致）。
         axis: halfspace 用，带符号轴名 'x'/'-x'/'y'/'-y'/'z'/'-z'。
         center: sphere 用，球心在局部包围盒内的归一化分数 (cx, cy, cz)。
         center_local: random_sphere/random_box 用。已采样好的球心/盒心，工件局部系，
@@ -87,8 +93,17 @@ def occlusion_keep(
     keep = torch.ones(
         pts_base.shape[0], pts_base.shape[1], dtype=torch.bool, device=pts_base.device
     )
-    if mode == "none" or severity <= 0.0:
+    if mode == "none":
         return keep
+    sev = torch.as_tensor(severity, dtype=pts_base.dtype, device=pts_base.device)
+    if sev.dim() == 0 and float(sev) <= 0.0:
+        return keep
+    if sev.dim() != 0 and mode != "random_box":
+        # 其余模式的语义都是标量比例，张量会被错误广播，显式拒绝而不是静默算错。
+        raise ValueError(
+            "(B,) tensor severity is only supported for random_box (per-env "
+            f"deletion ratio); got mode {mode!r}. Use a scalar for other modes."
+        )
 
     lo = obj_local_min.to(pts_base.device)
     hi = obj_local_max.to(pts_base.device)
@@ -140,11 +155,21 @@ def occlusion_keep(
         num_cand = local.shape[1]
         # 至少留 1 个存活点：否则上层 mask_depth_to_pointcloud 的 fallback
         # （first_kept = argmax(keep)）会顶替到一个被删点上。
-        k = min(max(int(round(severity * num_cand)), 0), num_cand - 1)
-        keep = torch.ones(local.shape[0], num_cand, dtype=torch.bool, device=pts_base.device)
-        if k > 0:
-            _, del_idx = torch.topk(d2, k, dim=1, largest=False)  # (B, k) 度量下最近 k 个
-            keep.scatter_(1, del_idx, torch.zeros_like(del_idx, dtype=torch.bool))
+        if sev.dim() == 0:
+            # 标量 severity：原 topk 路径一字未动（既有 stage2 调用方逐位不变）。
+            k = min(max(int(round(severity * num_cand)), 0), num_cand - 1)
+            keep = torch.ones(
+                local.shape[0], num_cand, dtype=torch.bool, device=pts_base.device
+            )
+            if k > 0:
+                _, del_idx = torch.topk(d2, k, dim=1, largest=False)  # (B, k) 度量下最近 k 个
+                keep.scatter_(1, del_idx, torch.zeros_like(del_idx, dtype=torch.bool))
+        else:
+            # (B,) 张量 severity：per-env 删除数不同，topk 无法按行取 k，改用秩阈值。
+            # 稠密秩 0 = 离盒心最近；keep = rank >= k 恰删每行最近 k 个（并列按索引序）。
+            k = (sev * num_cand).round().long().clamp_(0, num_cand - 1)   # (B,)
+            rank = torch.argsort(torch.argsort(d2, dim=1), dim=1)         # (B, P)
+            keep = rank >= k.unsqueeze(1)
     else:
         raise ValueError(
             f"unknown occlusion mode {mode!r}; expected "

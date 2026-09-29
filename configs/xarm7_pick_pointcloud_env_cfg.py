@@ -2208,7 +2208,10 @@ _SURF_CENTER_POOL = 256
 
 
 def randomize_occlusion_state(
-    env: ManagerBasedRLEnv, env_ids: torch.Tensor, occlusion_mode: str
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    occlusion_mode: str,
+    severity_range: tuple[float, float] | None = None,
 ) -> None:
     """每次 reset 为随机遮挡（random_sphere/random_box）重采球心/盒心与盒朝向。
 
@@ -2219,6 +2222,12 @@ def randomize_occlusion_state(
     工件上、阴影必在相机可见面（不会再采到包围盒空角/背面而"全绿"）；朝向走完整
     SO(3)（``random_orientation``），作为各向异性椭球度量（轴长=工件局部包围盒
     span）的主轴方向，**与工件轴解耦**。
+
+    severity_range：给出 ``(lo, hi)`` 时，被 reset 的环境每 episode 在 ``[lo, hi]``
+    内独立采样删除比例，写进 ``buf["severity"]``（张量 severity 路径，配合
+    :func:`point_bridge_point_cloud_yolo_occluded` 的范围模式）。默认 None 不采样
+    —— stage2 的既有注册（:func:`set_occlusion_stage2`）不传该参数，RNG 消耗顺序
+    与原行为完全一致。
 
     相机侧筛选在工件局部系做：把相机位置转到工件局部系，取"以工件中心为原点、
     指向相机"的半球表面点。本事件注册在所有 reset 事件之后（set_occlusion_stage2
@@ -2237,6 +2246,7 @@ def randomize_occlusion_state(
         {
             "center": torch.zeros(num_envs, 3, device=env.device),
             "quat": torch.zeros(num_envs, 4, device=env.device),
+            "severity": torch.zeros(num_envs, device=env.device),
         },
     )
     n = env_ids.numel()
@@ -2266,6 +2276,13 @@ def randomize_occlusion_state(
         buf["center"][env_ids] = lo + torch.rand((n, 3), device=env.device) * (hi - lo)
     # 朝向只有 random_box 会读（球旋转对称）；采样不动，保持 RNG 流结构简单
     buf["quat"][env_ids] = random_orientation(n, env.device)
+
+    # 张量 severity：per-env 每 episode 重采（YOLO 遮挡范围模式）。放在朝向采样
+    # **之后**，保持既有采样顺序不变；stage2 调用方（severity_range=None）完全不
+    # 经过这里，RNG 流不受影响。
+    if severity_range is not None:
+        lo, hi = severity_range
+        buf["severity"][env_ids] = lo + torch.rand((n,), device=env.device) * (hi - lo)
 
 
 _EMPTY_MASK_SNAPSHOT_DIR = "/root/autodl-tmp/empty_mask_debug"
@@ -2612,6 +2629,234 @@ def point_bridge_point_cloud_occluded(
     return point_cloud.reshape(num_envs, -1)
 
 
+def point_bridge_point_cloud_yolo_occluded(
+    env: ManagerBasedRLEnv,
+    camera_cfg: SceneEntityCfg = SceneEntityCfg("camera_fixed"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    m_obj: int = M_OBJ,
+    noise_std: float = NOISE_STD_M,
+    yolo_weights: str = DEFAULT_YOLO_WEIGHTS,
+    yolo_conf: float = YOLO_CONF,
+    yolo_step: int | None = None,
+    occlusion_mode: str = "random_box",
+    occlusion_severity: float = 0.0,
+    occlusion_severity_range: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """YOLO 掩码路线（stage 3/4）+ 坐标级 random_box 遮挡（M1 缺失型，仿真实验专用）。
+
+    = :func:`point_bridge_point_cloud_yolo`（``yolo_step=None``，每步跑 YOLO）或
+    :func:`point_bridge_point_cloud_yolo_cached`（``yolo_step>=1``，缓存掩码）的
+    掩码获取块，叠加 :func:`point_bridge_point_cloud_occluded` 的遮挡注入块：
+    掩码、深度、反投影、workspace 裁剪、FPS、噪声、零阶保持全部原样复用
+    ``mask_depth_to_pointcloud``，遮挡通过它的 ``occlusion_keep_fn`` 钩子注入。
+
+    遮挡形式只做 random_box（设计：tools/yolo_occlusion_m1_design.md）：盒心每
+    episode 从面向相机的表面点随机、朝向随机 SO(3)，按各向异性椭球度量删掉离盒心
+    最近的 severity 比例候选点。severity 两种给法::
+
+        occlusion_severity=0.6               固定比例（0 = 对照，与 stage 3/4 逐位一致）
+        occlusion_severity_range=(0.2, 0.6)  per-episode U[min,max]（张量 severity）
+
+    遮挡只作用在物体点上；夹爪 6 关键点、关节角、critic 特权状态都不受影响。观测
+    维度仍是 217，网络结构不变，可从 stage 3/4 的 checkpoint 热启动（**不是**
+    stage 2 的 —— 掩码来源不同）。
+    """
+    camera = env.scene[camera_cfg.name]
+    robot = env.scene[robot_cfg.name]
+    ee_frame = env.scene[ee_frame_cfg.name]
+    obj = env.scene[object_cfg.name]
+
+    device = env.device
+    num_envs = env.num_envs
+    key = id(env)
+
+    base_pos_w = robot.data.root_pos_w
+    base_quat_w = robot.data.root_quat_w
+
+    # ── 夹爪关键点（与 YOLO 路线逐字一致）──────────────────────────────────────
+    ee_pos_w = ee_frame.data.target_pos_w[:, 0, :]
+    ee_quat_w = ee_frame.data.target_quat_w[:, 0, :]
+    ee_pos_b, ee_quat_b = pose_in_frame(ee_pos_w, ee_quat_w, base_pos_w, base_quat_w)
+    robot_pts = gripper_keypoints(ee_pos_b, ee_quat_b, noise_std=0.0)
+
+    # ── 遮挡谓词（工件局部系）──────────────────────────────────────────────────
+    # 对照（mode=none 或固定 severity=0）不构造谓词，与 stage 3/4 走完全相同的
+    # 代码路径；范围模式恒构造（采样到 0 的行谓词自然全保留）。
+    occlusion_keep_fn = None
+    keep_condition = occlusion_mode != "none" and occlusion_severity > 0.0
+    severity_eff = occlusion_severity
+    if occlusion_severity_range is not None:
+        keep_condition = occlusion_mode != "none"
+        state = _OCCLUSION_STATE_BUF.get(id(env))
+        if state is not None and state.get("severity") is not None:
+            severity_eff = state["severity"]                     # (B,)，reset 事件每 episode 重采
+        else:
+            severity_eff = occlusion_severity_range[0]           # 构造期占位（shape 无关）
+    if keep_condition:
+        obj_pos_b, obj_quat_b = pose_in_frame(
+            obj.data.root_pos_w, obj.data.root_quat_w, base_pos_w, base_quat_w
+        )
+        obj_lo, obj_hi = _object_local_bounds(env)
+
+        # random_box：盒心/盒朝向来自 reset 事件采好的状态。构造期（ObservationManager
+        # 探测观测维度）会先于首次 reset 调用本函数，此时 buffer 为空，给确定性占位
+        # （中心=包围盒中心、单位朝向）；首次 reset 后写入真实采样。
+        state = _OCCLUSION_STATE_BUF.get(id(env))
+        if state is None:
+            center_local = ((obj_lo + obj_hi) * 0.5).unsqueeze(0).expand(num_envs, 3)
+            shape_quat_local = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0], device=device, dtype=obj_lo.dtype
+            ).unsqueeze(0).expand(num_envs, 4)
+        else:
+            center_local = state["center"]
+            shape_quat_local = state["quat"]
+
+        def occlusion_keep_fn(pts_base: torch.Tensor) -> torch.Tensor:
+            return occlusion_keep(
+                pts_base,
+                obj_pos_b,
+                obj_quat_b,
+                obj_lo,
+                obj_hi,
+                mode=occlusion_mode,
+                severity=severity_eff,
+                center_local=center_local,
+                shape_quat_local=shape_quat_local,
+            )
+
+    # ── 物体点：掩码来自 YOLO ───────────────────────────────────────────────
+    depth_raw = camera.data.output.get("distance_to_image_plane")
+    rgb_raw = camera.data.output.get("rgb")
+
+    obj_pts = None
+    if depth_raw is not None and rgb_raw is not None:
+        depth = depth_raw[..., 0] if depth_raw.dim() == 4 else depth_raw
+
+        if yolo_step is None:
+            # stage 3：每步跑 YOLO
+            mask, detected = yolo_masks(
+                rgb_raw, weights=yolo_weights, conf=yolo_conf
+            )
+            # 检出率进日志（不进观测）。这是这条路线最该盯的一个量：它掉下去说明
+            # 渲染画面漂出了 YOLO 的训练分布，点云会大面积走零阶保持。
+            env.extras["yolo_detect_ratio"] = detected.float().mean()
+        else:
+            # stage 4：每 yolo_step 步重跑 YOLO，其余步复用缓存掩码配当前深度帧
+            # （缓存的是掩码不是深度 —— 详见 point_bridge_point_cloud_yolo_cached）。
+            cached_mask = _LAST_YOLO_MASK.get(key)
+            counter = _YOLO_STEP_COUNTER.get(key, 0)
+            # 缓存形状必须与当前 batch 对齐 —— num_envs 变了（换 run / play 模式）
+            # 就必须重跑，否则下面 mask_depth_to_pointcloud 会广播出静默的错误结果。
+            stale = (
+                cached_mask is None
+                or cached_mask.shape[0] != num_envs
+                or cached_mask.shape[-2:] != depth.shape[-2:]
+            )
+            if stale or counter <= 0:
+                mask, detected = yolo_masks(
+                    rgb_raw, weights=yolo_weights, conf=yolo_conf
+                )
+                _LAST_YOLO_MASK[key] = mask
+                _YOLO_STEP_COUNTER[key] = max(1, int(yolo_step)) - 1
+                env.extras["yolo_detect_ratio"] = detected.float().mean()
+                env.extras["yolo_ran"] = torch.ones((), device=device)
+            else:
+                mask = cached_mask
+                _YOLO_STEP_COUNTER[key] = counter - 1
+                env.extras["yolo_ran"] = torch.zeros((), device=device)
+
+        cam_pos_b, cam_quat_b = pose_in_frame(
+            camera.data.pos_w, camera.data.quat_w_ros, base_pos_w, base_quat_w
+        )
+
+        occ_debug = _OCCLUSION_VIS.setdefault(key, {}) if key in _OCCLUSION_VIS_ENABLED else None
+        candidate_pts, counts = mask_depth_to_pointcloud(
+            mask=mask,
+            depth=depth,
+            K=camera.data.intrinsic_matrices,
+            cam_pos=cam_pos_b,
+            cam_quat=cam_quat_b,
+            m_obj=m_obj,
+            noise_std=noise_std,
+            occlusion_keep_fn=occlusion_keep_fn,
+            occlusion_debug=occ_debug,
+        )
+        # 可视化旁路：另算一张稠密遮挡图（逐像素），供录像画"遮挡整体形状"。
+        if occ_debug is not None and occlusion_keep_fn is not None:
+            occ_debug["occluded_map"] = dense_occlusion_pixel_map(
+                mask=mask,
+                depth=depth,
+                K=camera.data.intrinsic_matrices,
+                cam_pos=cam_pos_b,
+                cam_quat=cam_quat_b,
+                occlusion_keep_fn=occlusion_keep_fn,
+            ).detach()
+
+        env.extras["visible_ratio"] = (
+            counts.float() / float(m_obj)
+        ).clamp_(max=1.0).mean()
+
+        if key in _DEBUG_ENABLED:
+            _DEBUG_CAPTURE[key] = {
+                "mask_pixels": mask.flatten(1).sum(dim=1).detach(),
+                "visible_counts": counts.detach(),
+                "depth": depth.detach(),
+                "cam_pos_b": cam_pos_b.detach(),
+                "cam_quat_b": cam_quat_b.detach(),
+                "K": camera.data.intrinsic_matrices.detach(),
+            }
+
+        previous = _LAST_POINT_CLOUD.get(key)
+        empty = counts == 0
+        if bool(empty.any()):
+            if previous is None:
+                # ObservationManager 在 env 初始化时会调用一次每个观测函数来探测输出
+                # shape，此时相机尚未完成首次渲染，RGB 是全零张量，YOLO 检不出任何东西。
+                # 与 YOLO 路线保持一致：obj_pts 留 None，落到下面的零兜底，返回形状正确
+                # 的零张量。这一帧不会进入任何 rollout。
+                pass  # obj_pts remains None → zero fallback below
+            else:
+                candidate_pts = torch.where(
+                    empty.view(-1, 1, 1), previous[:, :m_obj, :], candidate_pts
+                )
+                strikes = _EMPTY_MASK_STRIKES.get(key, 0) + 1
+                _EMPTY_MASK_STRIKES[key] = strikes
+                if strikes > _MAX_EMPTY_STRIKES:
+                    if yolo_step is not None:
+                        # 缓存掩码下持续空检，额外的可能原因是掩码过期（工件已移动而
+                        # 缓存未失效）。强制下一帧重跑 YOLO，再存图记录。
+                        _LAST_YOLO_MASK.pop(key, None)
+                        _YOLO_STEP_COUNTER[key] = 0
+                    # 连续空检超限：存一张 RGB 快照到 logs/ 供事后排查，然后清零
+                    # 计数器继续训练，不崩溃。
+                    bad = int(torch.argmax(empty.to(torch.uint8)))
+                    _save_yolo_empty_rgb(
+                        rgb_raw, key, bad, int(mask[bad].sum())
+                    )
+                    _EMPTY_MASK_STRIKES[key] = 0
+                obj_pts = candidate_pts
+        else:
+            _EMPTY_MASK_STRIKES[key] = 0
+            obj_pts = candidate_pts
+
+    if obj_pts is None:
+        previous = _LAST_POINT_CLOUD.get(key)
+        if previous is not None:
+            obj_pts = previous[:, :m_obj, :]
+        else:
+            obj_pts = torch.zeros(num_envs, m_obj, POINT_DIM, device=device)
+
+    point_cloud = assemble_point_cloud(obj_pts, robot_pts)
+    _LAST_POINT_CLOUD[key] = point_cloud.detach()
+
+    if key in _DEBUG_ENABLED:
+        _DEBUG_CAPTURE.setdefault(key, {})["points"] = point_cloud.detach()
+
+    return point_cloud.reshape(num_envs, -1)
+
+
 def set_occlusion_stage2(
     env_cfg,
     mode: str = "none",
@@ -2653,4 +2898,62 @@ def set_occlusion_stage2(
             func=randomize_occlusion_state,
             mode="reset",
             params={"occlusion_mode": mode},
+        )
+
+
+def set_occlusion_yolo(
+    env_cfg,
+    severity: float = 0.0,
+    severity_range: tuple[float, float] | None = None,
+    yolo_step: int | None = None,
+    mode: str = "random_box",
+) -> None:
+    """把 stage 3/4（YOLO 掩码）的物体点观测换成带 random_box 遮挡的版本（M1 缺失型）。
+
+    **必须在 :func:`set_observation_stage`(cfg, 3 或 4) 之后调用**：它只替换观测
+    函数，不重设相机 data_types（保持深度 + RGB）、不碰 invalidate_instance_lut、
+    不碰任何其他 stage 的分支。
+
+    ``yolo_step=None`` 对应 stage 3（每步跑 YOLO）；``yolo_step>=1`` 对应 stage 4
+    （缓存掩码，并额外注册 :func:`invalidate_yolo_mask` —— 若 stage 4 分支已注册，
+    同 key 覆盖为等价行为）。
+
+    遮挡形式固定 random_box（设计：tools/yolo_occlusion_m1_design.md）。对照
+    （``mode='none'`` 或 ``severity=0``）时不构造遮挡谓词、也不注册遮挡 reset
+    事件，与 stage 3/4 逐位一致（包括 RNG 流）——用作"遮挡管线本身无副作用"的
+    对照。``severity_range=(lo,hi)`` 时每 episode 在 [lo,hi] 内独立采样删除比例
+    （张量 severity 路径，采样见 :func:`randomize_occlusion_state`）。
+    """
+    term = env_cfg.observations.policy.point_cloud
+    term.func = point_bridge_point_cloud_yolo_occluded
+    term.params = {
+        "camera_cfg": SceneEntityCfg("camera_fixed"),
+        "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+        "robot_cfg": SceneEntityCfg("robot"),
+        "object_cfg": SceneEntityCfg("object"),
+        "m_obj": M_OBJ,
+        "noise_std": NOISE_STD_M,
+        "yolo_weights": DEFAULT_YOLO_WEIGHTS,
+        "yolo_conf": YOLO_CONF,
+        "yolo_step": yolo_step,
+        "occlusion_mode": mode,
+        "occlusion_severity": severity,
+        "occlusion_severity_range": severity_range,
+    }
+    # 遮挡 reset 事件：random_box 需要每个 episode 重采盒心/盒朝向（范围模式还要
+    # 重采 severity）。只在遮挡真正激活时注册 —— 对照（severity=0 且无范围）不
+    # 注册，保证 reset 不额外消耗 RNG，与 stage 3/4 同 seed 逐位可复现。
+    occ_active = mode != "none" and (
+        severity > 0.0 or severity_range is not None
+    )
+    if occ_active:
+        env_cfg.events.randomize_occlusion_state = EventTerm(
+            func=randomize_occlusion_state,
+            mode="reset",
+            params={"occlusion_mode": mode, "severity_range": severity_range},
+        )
+    # stage 4 的掩码缓存必须在 reset 时失效（旧掩码指向上一 episode 的像素区域）。
+    if yolo_step is not None:
+        env_cfg.events.invalidate_yolo_mask = EventTerm(
+            func=invalidate_yolo_mask, mode="reset"
         )

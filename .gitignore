@@ -60,3 +60,4 @@ assets/usd/
 # Local model weights and encoder checkpoints
 model/*
 !model/.gitkeep
+root/
