@@ -180,3 +180,30 @@ echo $! > /root/autodl-tmp/logs/stage4_occ_rbox50.pid
 
 校验规则：`--occlusion_severity` 必须在 `[0,1]`；`--yolo_step >= 1`；
 min/max 成对且 `0 <= min <= max <= 1`。违反任意一条直接报错退出。
+
+## 8. 提交到 GitHub
+
+remote：`git@github.com:ludi0711/PointBridge-ld.git`（SSH，本机已配好 key）。
+改完这一版 M1 遮挡代码后，提交并推送：
+
+```bash
+cd /root/gx-va/gx-VA-isaaclab_v1
+printf 'root/\n' >> .gitignore      # 排除遮挡可视化跑出来的 mp4/csv 产物
+
+git add .gitignore \
+  configs/occlusion.py configs/xarm7_pick_pointcloud_env_cfg.py \
+  tools/training_commands.md \
+  scripts/train/train_pick_pointcloud_yolo_occluded.py \
+  tools/validate_pick_pointcloud_yolo_occlusion.py \
+  tools/yolo_occlusion_m1_design.md tools/yolo_occlusion_design.md
+
+git commit -m "Add M1 random_box occlusion (YOLO stage 3/4) + headless occlusion viz" \
+  -m "random_box per-env ratio occlusion injected pre-FPS in the YOLO mask route;
+headless red-marking viz script; design docs; training commands w/ log_root+nohup"
+
+git push origin main
+```
+
+> `.gitignore` 已排除 `logs/`、`*.pt`、`*.log`、`nohup.out` 等，所以推送的是源码 +
+> 文档，**不含** YOLO 权重、日志、checkpoint。另一台服务器拉代码：
+> `git clone git@github.com:ludi0711/PointBridge-ld.git`（那台机器的 SSH key 需先加到 GitHub）。

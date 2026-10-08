@@ -61,3 +61,4 @@ assets/usd/
 model/*
 !model/.gitkeep
 root/
+root/
